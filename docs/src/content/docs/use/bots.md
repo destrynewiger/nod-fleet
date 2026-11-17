@@ -9,6 +9,8 @@ Open `/bots` on your Nod installation. This page works before you connect a mode
 
 ## Connect your computers
 
+Bots and Apps are available before you select a separate AI provider for Nod's chat. You can finish computer and Crosswalk connections from the bot console during setup.
+
 1. Select **Connect computers**.
 2. Connect Desktop Commander at `https://mcp.desktopcommander.app/mcp` through the private MCP setup dialog.
 3. Select the connected account.

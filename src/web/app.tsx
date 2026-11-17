@@ -399,6 +399,7 @@ function AuthenticatedApp({
   const [finishingOnboarding, setFinishingOnboarding] = useState(false);
   const onboarding =
     path !== '/bots' &&
+    path !== '/apps' &&
     (finishingOnboarding || !session.settings!.onboardingCompleted || replayingOnboarding(path));
   useEffect(() => {
     if (
@@ -685,7 +686,8 @@ function AccountApp({
     capturePageview(
       (!session.settings?.onboardingCompleted || replayingOnboarding(path)) &&
         !secure &&
-        path !== '/bots'
+        path !== '/bots' &&
+        path !== '/apps'
         ? '/onboarding'
         : path === '/onboarding'
           ? '/'
@@ -701,7 +703,7 @@ function AccountApp({
     if (sessionState.loading || !session?.user || !session.settings) return;
     const secure = /^\/(?:vault|credentials|payments)\/[^/]+\/?$/.test(path) || path === '/browser';
     const next =
-      !session.settings.onboardingCompleted && !secure && path !== '/bots'
+      !session.settings.onboardingCompleted && !secure && path !== '/bots' && path !== '/apps'
         ? '/onboarding'
         : path === '/onboarding' && !replayingOnboarding(path)
           ? '/'
