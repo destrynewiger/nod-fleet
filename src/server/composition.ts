@@ -158,6 +158,11 @@ import { createDocumentation } from './documentation.ts';
 import { initializeDatabase, pool } from './db.ts';
 import { events, refresh } from './events.ts';
 import { createIntegrations } from './integrations.ts';
+import { createFleet } from './fleet.ts';
+import {
+  createDesktopCommanderFleet,
+  desktopCommanderEndpoint,
+} from '../providers/native-agent/desktop-commander.ts';
 import { gmailDraftTarget, gmailMessageTarget } from './action-presentation.ts';
 import {
   createErrorRedactor,
@@ -1238,6 +1243,52 @@ async function initializeApplication(
       : undefined,
     resumeConnection: resumeAfterConnection,
     refresh,
+  });
+  const fleet = await createFleet(pool, {
+    ownerId,
+    refresh,
+    provider: createDesktopCommanderFleet((connection, tool, input, signal) =>
+      discovered.execute(
+        'CONNECTED_MCP_CALL',
+        {
+          connectionId: connection.connectionId,
+          pathId: connection.pathId,
+          tool,
+          input,
+        },
+        undefined,
+        signal,
+        connection.binding,
+      ),
+    ),
+    connections: async () => {
+      const rows = await discovered.list();
+      return (
+        await Promise.all(
+          rows.map(async (row) => {
+            const path =
+              row.status === 'connected'
+                ? row.accessPaths?.find(
+                    (candidate) =>
+                      candidate.kind === 'mcp' && candidate.endpoint === desktopCommanderEndpoint,
+                  )
+                : undefined;
+            const binding =
+              path && row.connectionId ? await discovered.binding(row.connectionId) : undefined;
+            return path && row.connectionId && binding
+              ? [
+                  {
+                    connectionId: row.connectionId,
+                    pathId: path.id,
+                    name: row.accountName || row.name,
+                    binding,
+                  },
+                ]
+              : [];
+          }),
+        )
+      ).flat();
+    },
   });
   let vault!: Awaited<ReturnType<typeof createVault>>;
   let vaultAccess!: Awaited<ReturnType<typeof createVaultAccess>>;
@@ -2785,6 +2836,7 @@ async function initializeApplication(
     taskLedger: tasks.read,
     activity: activity.current,
     planningTasks: onboardingSuggestions.planning,
+    stopNative: fleet.stopAll,
     computer,
     configuration: () => {
       const alternative = alternativeModel(adapters.models);
@@ -2868,6 +2920,7 @@ async function initializeApplication(
   browserConnections.registerRoutes(app);
   adapters.integrationBrowser?.registerRoutes(app);
   integrations.registerRoutes(app);
+  fleet.registerRoutes(app);
   localFiles.registerRoutes(app);
   personal.registerRoutes(app);
   onboardingSuggestions.registerRoutes(app);
@@ -3070,6 +3123,7 @@ async function initializeApplication(
     stopConnectionInventory();
     const failures: unknown[] = [];
     for (const close of [
+      () => fleet.close(),
       () => adapters.integrationBrowser?.close(),
       () => adapters.passwordManager?.close(),
       () => adapters.localSpeech?.close(),
@@ -3094,6 +3148,7 @@ async function initializeApplication(
   });
   return {
     app,
+    fleet,
     runtime,
     personal,
     memory,

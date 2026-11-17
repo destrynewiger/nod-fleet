@@ -2,6 +2,7 @@
   "/": "Chat",
   "/tasks": "Scheduled",
   "/apps": "Apps",
+  "/bots": "Bots",
   "/channels": "Channels",
   "/usage": "Usage",
   "/vault": "Vault",

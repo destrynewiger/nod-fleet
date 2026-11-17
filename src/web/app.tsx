@@ -4,6 +4,7 @@ import { Chat } from './pages/chat';
 import { Usage } from './pages/usage';
 import { Vault } from './pages/vault';
 import { Apps } from './pages/apps';
+import { Bots } from './pages/bots';
 import { Channels } from './pages/channels';
 import { Credentials, Payment } from './pages/credentials';
 import { Scheduled } from './pages/tasks';
@@ -269,6 +270,7 @@ function Workspace({
               </>
             )}
             {path === '/apps' && <Apps configuration={state?.configuration} onAsk={askInChat} />}
+            {path === '/bots' && <Bots />}
             {path === '/channels' && <Channels />}
             {path === '/tasks' && (
               <Scheduled onAsk={askInChat} activity={connected ? state?.activity : undefined} />
@@ -396,7 +398,8 @@ function AuthenticatedApp({
   }, []);
   const [finishingOnboarding, setFinishingOnboarding] = useState(false);
   const onboarding =
-    finishingOnboarding || !session.settings!.onboardingCompleted || replayingOnboarding(path);
+    path !== '/bots' &&
+    (finishingOnboarding || !session.settings!.onboardingCompleted || replayingOnboarding(path));
   useEffect(() => {
     if (
       !onboarding ||
@@ -680,7 +683,9 @@ function AccountApp({
     const secure = /^\/(?:vault|credentials|payments)\/[^/]+\/?$/.test(path) || path === '/browser';
     if (path === '/memory' && session.settings?.onboardingCompleted) return;
     capturePageview(
-      (!session.settings?.onboardingCompleted || replayingOnboarding(path)) && !secure
+      (!session.settings?.onboardingCompleted || replayingOnboarding(path)) &&
+        !secure &&
+        path !== '/bots'
         ? '/onboarding'
         : path === '/onboarding'
           ? '/'
@@ -696,7 +701,7 @@ function AccountApp({
     if (sessionState.loading || !session?.user || !session.settings) return;
     const secure = /^\/(?:vault|credentials|payments)\/[^/]+\/?$/.test(path) || path === '/browser';
     const next =
-      !session.settings.onboardingCompleted && !secure
+      !session.settings.onboardingCompleted && !secure && path !== '/bots'
         ? '/onboarding'
         : path === '/onboarding' && !replayingOnboarding(path)
           ? '/'

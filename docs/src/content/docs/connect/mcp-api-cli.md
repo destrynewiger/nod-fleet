@@ -33,6 +33,8 @@ Nod loads n8n's tools only when a task needs them and follows n8n's own guide fo
 
 ## Connect another service
 
+This fork also has a [Bots page](/use/bots/) for native agents on specific computers. It uses a separate Desktop Commander connection. Those agents keep their host accounts and permissions.
+
 To connect an MCP server yourself, open **Apps** and select **Connect MCP**. Enter a name and the public HTTPS server URL, then choose browser sign-in, an access token or an API key. Select **Continue** to finish authentication in the private setup dialog. **Connection details** shows any extra setup instructions. Tokens stay outside the chat.
 
 Ask Nod to connect a service it can't find in the app catalog. Nod proposes a way in, called an access path, and sends you a link to a private setup page. There, you paste a token or sign in. The model never sees the token.

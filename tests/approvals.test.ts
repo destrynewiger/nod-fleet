@@ -869,9 +869,16 @@ test('localhost access requires the owner key and rejects foreign Host, Origin a
     registerLocalAccess(app, 4310, { key });
     app.post('/api/fixture', async () => ({ ok: true }));
     app.get('/api/privacy', async () => ({ content: null }));
-    const settingsPages = ['/settings', '/settings/models', '/settings/apps', '/settings/memory'];
+    const settingsPages = [
+      '/settings',
+      '/settings/models',
+      '/settings/apps',
+      '/settings/memory',
+      '/bots',
+    ];
     for (const path of settingsPages) app.get(path, async () => 'nod');
     app.get('/api/settings', async () => ({ private: true }));
+    app.get('/api/fleet', async () => ({ private: true }));
     const navigation = {
       host: 'localhost:4310',
       'sec-fetch-site': 'cross-site',
@@ -888,7 +895,8 @@ test('localhost access requires the owner key and rejects foreign Host, Origin a
     }
     for (const path of ['/settings/unknown', '/settings-typo'])
       assert.equal((await app.inject({ url: path, headers: navigation })).statusCode, 403);
-    assert.equal((await app.inject({ url: '/api/settings', headers: navigation })).statusCode, 401);
+    for (const path of ['/api/settings', '/api/fleet'])
+      assert.equal((await app.inject({ url: path, headers: navigation })).statusCode, 401);
     assert.equal(
       (
         await app.inject({

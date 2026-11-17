@@ -17,10 +17,12 @@ export function ManualMcpDialog({
   onClose,
   onCreated,
   returnFocus,
+  initial,
 }: {
   onClose(): void;
   onCreated(id: string): void;
   returnFocus(): HTMLElement | null;
+  initial?: { name: string; endpoint: string };
 }) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
@@ -81,6 +83,7 @@ export function ManualMcpDialog({
           <Field label="Name">
             <Input
               name="name"
+              defaultValue={initial?.name}
               placeholder="My workspace"
               required
               minLength={2}
@@ -92,6 +95,7 @@ export function ManualMcpDialog({
           <Field label="Server URL">
             <Input
               name="endpoint"
+              defaultValue={initial?.endpoint}
               type="url"
               placeholder="https://example.com/mcp"
               pattern="[Hh][Tt][Tt][Pp][Ss]://.*"

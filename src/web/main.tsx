@@ -21,6 +21,7 @@ import './pages/chat.css';
 import './theme.css';
 import './pages/secondary-pages.css';
 import './pages/apps.css';
+import './pages/bots.css';
 import './components/integration-card.css';
 import './components/app-connection-dialog.css';
 import './pages/channels.css';

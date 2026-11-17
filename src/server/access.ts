@@ -68,6 +68,7 @@ export function registerLocalAccess(
     '/vault',
     '/trust',
     '/apps',
+    '/bots',
     '/onboarding',
     '/connected.html',
     '/channels',

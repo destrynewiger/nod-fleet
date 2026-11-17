@@ -204,6 +204,7 @@ export interface AppDependencies {
   taskLedger?: () => Promise<import('../shared/contracts.ts').Task[]>;
   activity?: () => Promise<Activity[]>;
   planningTasks?: () => string | undefined;
+  stopNative?: () => Promise<void>;
 }
 
 export async function createApp(dependencies: AppDependencies = {}) {
@@ -589,6 +590,7 @@ export async function createApp(dependencies: AppDependencies = {}) {
     const capture = snapshotAnalytics(dependencies.analytics);
     return audioMessages.pause(async () => {
       const { browsers } = await stopThread(capture);
+      await dependencies.stopNative?.();
       await Promise.allSettled(browsers.map((id) => dependencies.computer?.clear(id)));
       return { ok: true };
     });
