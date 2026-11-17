@@ -25,6 +25,7 @@ import {
   Notice,
 } from '../components/ui';
 import { api, ApiError, errorMessage, post } from '../lib/api';
+import { fleetResult } from '../lib/fleet-result';
 import { usePageData } from '../hooks/use-page-data';
 
 const engineNames: Record<FleetEngine, string> = {
@@ -70,6 +71,26 @@ const statuses: Record<FleetJob['status'], string> = {
 const active = (job: FleetJob) =>
   ['starting', 'running', 'queued', 'claimed', 'stopping', 'uncertain'].includes(job.status);
 const native = (engine: FleetEngine) => (nativeEngines as readonly string[]).includes(engine);
+
+function AgentResult({ job }: { job: FleetJob }) {
+  const output = job.receipt?.output;
+  if (!output) return null;
+  const result = job.delivery === 'native' ? fleetResult(job.engine, output) : output;
+  return (
+    <>
+      <details open={['finished', 'reported', 'failed'].includes(job.status)}>
+        <summary>Agent result</summary>
+        <pre>{result}</pre>
+      </details>
+      {result !== output && (
+        <details>
+          <summary>Agent log</summary>
+          <pre>{output}</pre>
+        </details>
+      )}
+    </>
+  );
+}
 
 function BotEditor({
   bot,
@@ -689,12 +710,7 @@ export function Bots() {
               </p>
             )}
             {job.error && <Notice>{job.error}</Notice>}
-            {job.receipt?.output && (
-              <details open={job.status === 'finished' || job.status === 'reported'}>
-                <summary>Agent result</summary>
-                <pre>{job.receipt.output}</pre>
-              </details>
-            )}
+            <AgentResult job={job} />
             <footer>
               <time dateTime={job.createdAt}>{new Date(job.createdAt).toLocaleString()}</time>
               <div>

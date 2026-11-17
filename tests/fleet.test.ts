@@ -17,6 +17,27 @@ import { createFleet } from '../src/server/fleet.ts';
 import { createCrosswalkFleet } from '../src/providers/crosswalk/fleet.ts';
 import type { FleetBot, FleetJob, FleetView } from '../src/shared/fleet.ts';
 import type { FleetSpec } from '../src/ports/fleet.ts';
+import { fleetResult } from '../src/web/lib/fleet-result.ts';
+
+test('Hermes receipts show the final protocol reply and retain non-protocol output', () => {
+  const reply = 'The requested result.\nA second line.';
+  const output = [
+    'A synthetic startup warning.',
+    JSON.stringify({ type: 'text', text: 'A partial reply.' }),
+    JSON.stringify({ type: 'result', text: reply, exit_code: 0 }),
+    'session_id: synthetic-session',
+  ].join('\r\n');
+  assert.equal(fleetResult('hermes', output), reply);
+  const failure = JSON.stringify({
+    type: 'result',
+    text: 'Sign in to the selected provider.',
+    exit_code: 1,
+  });
+  assert.equal(fleetResult('hermes', failure), 'Sign in to the selected provider.');
+  assert.equal(fleetResult('hermes', 'Unstructured engine output.'), 'Unstructured engine output.');
+  assert.equal(fleetResult('hermes', '{"type":"result","text":42}'), '{"type":"result","text":42}');
+  assert.equal(fleetResult('claude', output), output);
+});
 
 const content = (text: string) => ({ content: [{ type: 'text', text }] });
 const specHash = (spec: FleetSpec) =>
