@@ -159,6 +159,9 @@ import { initializeDatabase, pool } from './db.ts';
 import { events, refresh } from './events.ts';
 import { createIntegrations } from './integrations.ts';
 import { createFleet } from './fleet.ts';
+import { createCrosswalkFleet } from '../providers/crosswalk/fleet.ts';
+import { crosswalkEndpoint } from '../shared/fleet.ts';
+import type { FleetConnection } from '../ports/fleet.ts';
 import {
   createDesktopCommanderFleet,
   desktopCommanderEndpoint,
@@ -1244,23 +1247,28 @@ async function initializeApplication(
     resumeConnection: resumeAfterConnection,
     refresh,
   });
+  const callFleetTool = (
+    connection: FleetConnection,
+    tool: string,
+    input: Record<string, unknown>,
+    signal?: AbortSignal,
+  ) =>
+    discovered.execute(
+      'CONNECTED_MCP_CALL',
+      {
+        connectionId: connection.connectionId,
+        pathId: connection.pathId,
+        tool,
+        input,
+      },
+      undefined,
+      signal,
+      connection.binding,
+    );
   const fleet = await createFleet(pool, {
     ownerId,
     refresh,
-    provider: createDesktopCommanderFleet((connection, tool, input, signal) =>
-      discovered.execute(
-        'CONNECTED_MCP_CALL',
-        {
-          connectionId: connection.connectionId,
-          pathId: connection.pathId,
-          tool,
-          input,
-        },
-        undefined,
-        signal,
-        connection.binding,
-      ),
-    ),
+    provider: createCrosswalkFleet(createDesktopCommanderFleet(callFleetTool), callFleetTool),
     connections: async () => {
       const rows = await discovered.list();
       return (
@@ -1270,7 +1278,9 @@ async function initializeApplication(
               row.status === 'connected'
                 ? row.accessPaths?.find(
                     (candidate) =>
-                      candidate.kind === 'mcp' && candidate.endpoint === desktopCommanderEndpoint,
+                      candidate.kind === 'mcp' &&
+                      (candidate.endpoint === desktopCommanderEndpoint ||
+                        candidate.endpoint.replace(/\/+$/, '') === crosswalkEndpoint),
                   )
                 : undefined;
             const binding =
@@ -1279,6 +1289,10 @@ async function initializeApplication(
               ? [
                   {
                     connectionId: row.connectionId,
+                    kind:
+                      path.endpoint === desktopCommanderEndpoint
+                        ? ('desktop-commander' as const)
+                        : ('crosswalk' as const),
                     pathId: path.id,
                     name: row.accountName || row.name,
                     binding,

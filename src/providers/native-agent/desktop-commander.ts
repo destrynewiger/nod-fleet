@@ -239,7 +239,7 @@ export function createDesktopCommanderFleet(call: Call): FleetProvider {
     },
     async start(connection, spec, digest, claimed, signal) {
       const worker = await same(connection, spec, signal);
-      if (!worker.identity.engines.includes(spec.engine)) {
+      if (spec.handoff || !worker.identity.engines.some((engine) => engine === spec.engine)) {
         await send(connection, spec.deviceId, worker.pid, { operation: 'close' }, signal).catch(
           () => {},
         );

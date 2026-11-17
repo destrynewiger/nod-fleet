@@ -133,6 +133,10 @@
   display: grid;
   gap: 16px;
 }
+.bot-editor {
+  max-height: calc(100dvh - 32px);
+  overflow: auto;
+}
 .bot-task-input {
   min-height: 120px;
   resize: vertical;

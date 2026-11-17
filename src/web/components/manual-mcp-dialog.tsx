@@ -22,11 +22,11 @@ export function ManualMcpDialog({
   onClose(): void;
   onCreated(id: string): void;
   returnFocus(): HTMLElement | null;
-  initial?: { name: string; endpoint: string };
+  initial?: { name: string; endpoint: string; auth?: 'oauth' | 'bearer' | 'x-api-key' };
 }) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
-  const [auth, setAuth] = useState('oauth');
+  const [auth, setAuth] = useState<string>(initial?.auth ?? 'oauth');
   const [clientIdRequired, setClientIdRequired] = useState(false);
   const request = useRef<AbortController | null>(null);
   const continuing = useRef(false);

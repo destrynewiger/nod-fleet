@@ -14,6 +14,7 @@ import {
   parseFleetDevices,
 } from '../src/providers/native-agent/desktop-commander.ts';
 import { createFleet } from '../src/server/fleet.ts';
+import { createCrosswalkFleet } from '../src/providers/crosswalk/fleet.ts';
 import type { FleetBot, FleetJob, FleetView } from '../src/shared/fleet.ts';
 import type { FleetSpec } from '../src/ports/fleet.ts';
 
@@ -228,7 +229,7 @@ test(
     const digest = specHash(spec);
     let pid = 0;
     let result = await fixture.provider.start(connection, spec, digest, async (value) => {
-      pid = value;
+      pid = value ?? 0;
     });
     result ??= await eventually(async () => {
       const found = await fixture.provider.receipt(connection, { ...spec, digest, pid });
@@ -273,7 +274,7 @@ test(
       const digest = specHash(spec);
       let pid = 0;
       const first = await fixture.provider.start(connection, spec, digest, async (value) => {
-        pid = value;
+        pid = value ?? 0;
       });
       return { run: { ...spec, digest, pid }, first };
     }
@@ -448,7 +449,7 @@ test(
         revision: unsupported.revision,
         instruction: 'No implicit CLI substitution',
       }),
-      /supported native adapter/,
+      /Crosswalk route/,
     );
     const missingId = randomUUID();
     const missing = await a.fleet.saveBot(missingId, {
@@ -488,5 +489,315 @@ test(
       (await restarted.fleet.check(recoveredId)).status === 'stopped' ? true : undefined,
     );
     assert.equal(await fixture.count(), 4);
+  },
+);
+
+test(
+  'Crosswalk handoffs bind private recipients, reconcile a lost reply without resending, and preserve remote stop semantics',
+  { skip: !process.env.TEST_DATABASE_URL || process.platform === 'win32' },
+  async (t) => {
+    const desktop = await desktopFixture();
+    const schema = 'fleet_relay_' + randomUUID().replaceAll('-', '');
+    const admin = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL });
+    await admin.query('CREATE SCHEMA ' + schema);
+    const pool = new pg.Pool({
+      connectionString: process.env.TEST_DATABASE_URL,
+      options: '-c search_path=' + schema,
+    });
+    await pool.query(
+      'CREATE TABLE fixture_crosswalk_tasks(id text PRIMARY KEY,data jsonb NOT NULL)',
+    );
+    const relayConnection: FleetConnection = {
+      kind: 'crosswalk',
+      connectionId: '40000000-0000-4000-8000-000000000001',
+      pathId: '50000000-0000-4000-8000-000000000001',
+      name: 'Example handoff account',
+      binding: 'fixture-relay-binding',
+    };
+    const recipient = '1111000011110001';
+    let username = 'example-owner';
+    let loseReply = false;
+    let aliasCollision = false;
+    const remote = Fastify();
+    remote.post<{ Body: { tool: string; input: Record<string, unknown> } }>(
+      '/mcp-call',
+      async (request, reply) => {
+        const { tool, input } = request.body;
+        const response = (data: unknown) => content(JSON.stringify(data));
+        if (tool === 'account_whoami')
+          return response({
+            username,
+            crosswalks: [
+              { slug: 'example-private', visibility: 'private', own: true },
+              { slug: 'example-public', visibility: 'public', own: true },
+              { slug: 'someone-else', visibility: 'private' },
+            ],
+          });
+        if (tool === 'account_numbers')
+          return response({
+            you: '1111000000000000',
+            numbers: [
+              { agent: 'Example sender', number: '1111000000000000' },
+              { agent: 'Example agent', number: recipient },
+              ...(aliasCollision
+                ? [
+                    {
+                      agent: 'Other agent',
+                      number: '1111000011110002',
+                      also_answers_as: ['Example agent'],
+                    },
+                  ]
+                : []),
+            ],
+          });
+        if (tool === 'tasks_add') {
+          assert.equal(input.crosswalk, 'example-private');
+          assert.equal(input.for, recipient);
+          assert.equal(input.invite, false);
+          const id = randomUUID();
+          const task = {
+            id,
+            title: input.title,
+            details: input.details,
+            for: input.for,
+            crosswalk: input.crosswalk,
+            status: 'open',
+            created_at: new Date().toISOString(),
+          };
+          await pool.query('INSERT INTO fixture_crosswalk_tasks(id,data) VALUES($1,$2)', [
+            id,
+            JSON.stringify(task),
+          ]);
+          if (loseReply) {
+            loseReply = false;
+            return reply
+              .code(503)
+              .send({ error: 'Synthetic reply lost after committing the remote task.' });
+          }
+          return response({ kind: 'task_added', task });
+        }
+        if (tool === 'tasks_list') {
+          assert.equal(input.crosswalk, 'example-private');
+          const tasks = (
+            await pool.query<{ data: Record<string, unknown> }>(
+              'SELECT data FROM fixture_crosswalk_tasks ORDER BY id',
+            )
+          ).rows.map((row) => row.data);
+          return response({
+            for_you: [],
+            open: tasks.filter((task) => task.status === 'open'),
+            done: tasks.filter((task) => task.status === 'done'),
+          });
+        }
+        const task = (
+          await pool.query<{ data: Record<string, unknown> }>(
+            'SELECT data FROM fixture_crosswalk_tasks WHERE id=$1',
+            [input.id],
+          )
+        ).rows[0]?.data;
+        assert.ok(task);
+        if (tool === 'tasks_get') return response({ kind: 'task', task });
+        assert.equal(tool, 'tasks_update');
+        assert.deepEqual(Object.keys(input).sort(), ['id', 'title']);
+        const updated = { ...task, title: input.title };
+        await pool.query('UPDATE fixture_crosswalk_tasks SET data=$2 WHERE id=$1', [
+          input.id,
+          JSON.stringify(updated),
+        ]);
+        return response({ kind: 'task_updated', task: updated });
+      },
+    );
+    await remote.listen({ host: '127.0.0.1', port: 0 });
+    const address = remote.server.address();
+    assert.ok(address && typeof address === 'object');
+    const provider = createCrosswalkFleet(
+      desktop.provider,
+      async (selected, tool, input, signal) => {
+        assert.equal(selected.connectionId, relayConnection.connectionId);
+        assert.equal(selected.binding, relayConnection.binding);
+        const response = await fetch('http://127.0.0.1:' + address.port + '/mcp-call', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ tool, input }),
+          signal,
+        });
+        if (!response.ok) throw new Error('Synthetic Crosswalk HTTP ' + response.status);
+        return response.json();
+      },
+    );
+    const applications: Array<{
+      app: ReturnType<typeof Fastify>;
+      fleet: Awaited<ReturnType<typeof createFleet>>;
+    }> = [];
+    t.after(async () => {
+      for (const item of applications) {
+        await item.fleet.stopAll();
+        await item.fleet.close();
+        await item.app.close();
+      }
+      await remote.close();
+      await desktop.close();
+      await pool.end();
+      await admin.query('DROP SCHEMA ' + schema + ' CASCADE');
+      await admin.end();
+    });
+    async function application(ownerId: string) {
+      const fleet = await createFleet(pool, {
+        ownerId,
+        provider,
+        connections: async () => [connection, relayConnection],
+        refresh() {},
+      });
+      const app = Fastify();
+      fleet.registerRoutes(app);
+      applications.push({ app, fleet });
+      await app.inject({
+        method: 'PUT',
+        url: '/api/fleet/connection',
+        payload: { connectionId: connection.connectionId },
+      });
+      return { app, fleet };
+    }
+    let sut = await application('relay-owner-a');
+    const directory = await provider.directory!(relayConnection);
+    assert.deepEqual(
+      directory.recipients.map((agent) => agent.id),
+      [recipient],
+    );
+    assert.deepEqual(directory.spaces, ['example-private']);
+    const id = randomUUID();
+    const assignment = {
+      name: 'Example app agent',
+      engine: 'muse-web',
+      delivery: 'crosswalk',
+      profile: null,
+      deviceId,
+      revision: 0,
+      handoff: { connectionId: relayConnection.connectionId, recipient, space: 'example-private' },
+    };
+    const saved = await sut.fleet.saveBot(id, assignment);
+    assert.equal(saved.handoff?.username, 'example-owner');
+    const count = async () =>
+      (
+        await pool.query<{ count: number }>(
+          'SELECT count(*)::int AS count FROM fixture_crosswalk_tasks',
+        )
+      ).rows[0]!.count;
+    const input = {
+      id: randomUUID(),
+      revision: 1,
+      instruction: 'Return a synthetic readiness result. Do not use any real service.',
+    };
+    loseReply = true;
+    await sut.fleet.submit(id, input);
+    await eventually(async () =>
+      (await sut.app.inject('/api/fleet/jobs/' + input.id)).json<FleetJob>().status === 'uncertain'
+        ? true
+        : undefined,
+    );
+    assert.equal(await count(), 1);
+    await sut.fleet.close();
+    sut = await application('relay-owner-a');
+    const replay = await sut.fleet.submit(id, input);
+    assert.equal(replay.status, 'uncertain');
+    assert.equal(await count(), 1);
+    await assert.rejects(
+      sut.fleet.submit(id, { ...input, instruction: 'A different request' }),
+      /different request/,
+    );
+    const queued = await sut.fleet.check(input.id);
+    assert.equal(queued.status, 'queued');
+    assert.equal(queued.delivery, 'crosswalk');
+    assert.equal(queued.recipient, 'Example agent');
+    assert.equal(await count(), 1);
+    const remoteId = queued.receipt!.remoteId!;
+    const changeTask = async (change: Record<string, unknown>) =>
+      pool.query('UPDATE fixture_crosswalk_tasks SET data=data || $2::jsonb WHERE id=$1', [
+        remoteId,
+        JSON.stringify(change),
+      ]);
+    await changeTask({ for: 'Unrelated agent' });
+    assert.equal((await sut.fleet.check(input.id)).status, 'uncertain');
+    await changeTask({ for: recipient, claimed_by: 'Example agent' });
+    assert.equal((await sut.fleet.check(input.id)).status, 'claimed');
+    await assert.rejects(sut.fleet.saveBot(id, { ...assignment, revision: 1 }), /current task/);
+    await changeTask({
+      status: 'done',
+      done_at: new Date().toISOString(),
+      done_note: 'Synthetic readiness result only.',
+    });
+    const reported = await sut.fleet.check(input.id);
+    assert.equal(reported.status, 'reported');
+    assert.equal(reported.receipt?.output, 'Synthetic readiness result only.');
+    assert.equal(await desktop.count(), 0);
+    const pendingId = randomUUID();
+    await sut.fleet.saveBot(pendingId, {
+      ...assignment,
+      name: 'Pending Hermes relay',
+      engine: 'hermes',
+      handoff: null,
+    });
+    await assert.rejects(
+      sut.fleet.submit(pendingId, { ...input, id: randomUUID() }),
+      /Crosswalk route/,
+    );
+    await assert.rejects(
+      sut.fleet.saveBot(randomUUID(), {
+        ...assignment,
+        name: 'Public room',
+        handoff: { ...assignment.handoff, space: 'example-public' },
+      }),
+      /owned private/,
+    );
+    const foreign = await application('relay-owner-b');
+    assert.equal((await foreign.app.inject('/api/fleet/jobs/' + input.id)).statusCode, 404);
+    username = 'changed-account';
+    const refused = { ...input, id: randomUUID() };
+    await sut.fleet.submit(id, refused);
+    await eventually(async () =>
+      (await sut.app.inject('/api/fleet/jobs/' + refused.id)).json<FleetJob>().status === 'failed'
+        ? true
+        : undefined,
+    );
+    assert.equal(await count(), 1);
+    username = 'example-owner';
+    aliasCollision = true;
+    const ambiguous = { ...input, id: randomUUID() };
+    await sut.fleet.submit(id, ambiguous);
+    await eventually(async () =>
+      (await sut.app.inject('/api/fleet/jobs/' + ambiguous.id)).json<FleetJob>().status === 'failed'
+        ? true
+        : undefined,
+    );
+    assert.equal(await count(), 1);
+    aliasCollision = false;
+    const stoppedInput = { ...input, id: randomUUID() };
+    await sut.fleet.submit(id, stoppedInput);
+    const stoppable = await eventually(async () => {
+      const job = (await sut.app.inject('/api/fleet/jobs/' + stoppedInput.id)).json<FleetJob>();
+      return job.status === 'queued' ? job : undefined;
+    });
+    await sut.fleet.stopAll();
+    await eventually(async () => {
+      const record = (
+        await pool.query<{ data: { title: string } }>(
+          'SELECT data FROM fixture_crosswalk_tasks WHERE id=$1',
+          [stoppable.receipt!.remoteId],
+        )
+      ).rows[0]!.data;
+      return record.title.endsWith('stop requested') ? true : undefined;
+    });
+    assert.equal((await sut.fleet.check(stoppedInput.id)).status, 'stopping');
+    await pool.query('UPDATE fixture_crosswalk_tasks SET data=data || $2::jsonb WHERE id=$1', [
+      stoppable.receipt!.remoteId,
+      JSON.stringify({
+        status: 'done',
+        done_at: new Date().toISOString(),
+        done_note: 'Stopped before any action.',
+      }),
+    ]);
+    assert.equal((await sut.fleet.check(stoppedInput.id)).status, 'reported');
+    assert.equal(await count(), 2);
+    assert.equal(await desktop.count(), 0);
   },
 );

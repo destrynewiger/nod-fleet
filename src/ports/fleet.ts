@@ -1,4 +1,10 @@
-import type { FleetIdentity, FleetReceipt, NativeEngine } from '../shared/fleet.ts';
+import type {
+  FleetDirectory,
+  FleetEngine,
+  FleetHandoff,
+  FleetIdentity,
+  FleetReceipt,
+} from '../shared/fleet.ts';
 export { nativeEngines } from '../shared/fleet.ts';
 export type { FleetEngine, FleetIdentity, FleetReceipt, NativeEngine } from '../shared/fleet.ts';
 
@@ -13,6 +19,7 @@ export class FleetDispatchError extends Error {
 }
 
 export interface FleetConnection {
+  kind?: 'desktop-commander' | 'crosswalk';
   connectionId: string;
   pathId: string;
   name: string;
@@ -30,22 +37,21 @@ export interface FleetSpec {
   deviceId: string;
   identityId: string;
   hostname: string;
-  engine: NativeEngine;
+  engine: FleetEngine;
   profile: string | null;
   instruction: string;
+  handoff?: FleetHandoff & { connection: FleetConnection };
 }
 
-export interface FleetRun {
-  deviceId: string;
-  identityId: string;
-  hostname: string;
-  id: string;
+export interface FleetRun extends FleetSpec {
   digest: string;
-  engine: NativeEngine;
   pid: number | null;
+  remoteId?: string;
+  stopRequested?: boolean;
 }
 
 export interface FleetProvider {
+  directory?(connection: FleetConnection, signal?: AbortSignal): Promise<FleetDirectory>;
   devices(connection: FleetConnection, signal?: AbortSignal): Promise<FleetDevice[]>;
   probe(
     connection: FleetConnection,
@@ -56,7 +62,7 @@ export interface FleetProvider {
     connection: FleetConnection,
     spec: FleetSpec,
     digest: string,
-    claimed: (pid: number) => Promise<void>,
+    claimed: (pid: number | null) => Promise<void>,
     signal?: AbortSignal,
   ): Promise<FleetReceipt | null>;
   receipt(

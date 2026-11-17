@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import {
   desktopCommanderEndpoint,
+  crosswalkEndpoint,
   nativeEngines,
   type FleetBot,
+  type FleetDirectory,
   type FleetEngine,
   type FleetJob,
   type FleetView,
@@ -49,13 +51,16 @@ const serviceDetails: Partial<Record<FleetEngine, { url?: string; text: string }
     text: 'Instinct uses its own email and text account. This computer assignment does not move that account.',
   },
   'grok-bot': {
-    text: 'Grok Bot uses its own local app and selected computer. A supported task connection is still required.',
+    text: 'Grok Bot receives tasks through its connected Crosswalk account.',
   },
-  dots: { text: 'Dots run in the ChatGPT app. A supported task connection is still required.' },
+  dots: { text: 'Dots run in the ChatGPT app and receive tasks through Crosswalk.' },
 };
 const statuses: Record<FleetJob['status'], string> = {
   starting: 'Dispatching',
   running: 'Running',
+  queued: 'Handoff queued',
+  claimed: 'Agent claimed task',
+  reported: 'Result reported',
   stopping: 'Stopping',
   finished: 'Run finished',
   failed: 'Failed',
@@ -63,7 +68,7 @@ const statuses: Record<FleetJob['status'], string> = {
   uncertain: 'Needs review',
 };
 const active = (job: FleetJob) =>
-  ['starting', 'running', 'stopping', 'uncertain'].includes(job.status);
+  ['starting', 'running', 'queued', 'claimed', 'stopping', 'uncertain'].includes(job.status);
 const native = (engine: FleetEngine) => (nativeEngines as readonly string[]).includes(engine);
 
 function BotEditor({
@@ -79,9 +84,37 @@ function BotEditor({
 }) {
   const [engine, setEngine] = useState<FleetEngine>(bot?.engine ?? 'hermes');
   const [deviceId, setDeviceId] = useState(bot?.deviceId ?? '');
+  const [delivery, setDelivery] = useState<'native' | 'crosswalk'>(
+    bot?.delivery === 'crosswalk' || bot?.handoff || !native(bot?.engine ?? 'hermes')
+      ? 'crosswalk'
+      : 'native',
+  );
+  const [handoffAccount, setHandoffAccount] = useState(
+    bot?.handoff?.connectionId ?? view.handoffConnections[0]?.id ?? '',
+  );
+  const [recipient, setRecipient] = useState(bot?.handoff?.recipient ?? '');
+  const [space, setSpace] = useState(bot?.handoff?.space ?? '');
+  const [directory, setDirectory] = useState<FleetDirectory | null>(null);
+  const [directoryError, setDirectoryError] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const id = useRef(bot?.id ?? crypto.randomUUID());
+  useEffect(() => {
+    const controller = new AbortController();
+    setDirectory(null);
+    setDirectoryError('');
+    if (delivery === 'crosswalk' && handoffAccount)
+      void api<FleetDirectory>('/api/fleet/handoffs/' + handoffAccount, {
+        signal: controller.signal,
+      })
+        .then((value) => {
+          if (!controller.signal.aborted) setDirectory(value);
+        })
+        .catch((cause) => {
+          if (!controller.signal.aborted) setDirectoryError(errorMessage(cause));
+        });
+    return () => controller.abort();
+  }, [delivery, handoffAccount]);
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (busy) return;
@@ -94,7 +127,15 @@ function BotEditor({
         body: JSON.stringify({
           name: values.get('name'),
           engine,
-          profile: engine === 'hermes' ? String(values.get('profile') ?? '').trim() || null : null,
+          delivery,
+          profile:
+            engine === 'hermes' && delivery === 'native'
+              ? String(values.get('profile') ?? '').trim() || null
+              : null,
+          handoff:
+            delivery === 'crosswalk' && handoffAccount
+              ? { connectionId: handoffAccount, recipient, space }
+              : null,
           deviceId: deviceId || null,
           computerName: String(values.get('computerName') ?? '').trim() || 'Not assigned',
           revision: bot?.revision ?? 0,
@@ -123,18 +164,115 @@ function BotEditor({
             <select
               className="input"
               value={engine}
-              onChange={(event) => setEngine(event.target.value as FleetEngine)}
+              onChange={(event) => {
+                const next = event.target.value as FleetEngine;
+                setEngine(next);
+                if (!native(next)) setDelivery('crosswalk');
+              }}
               disabled={busy}
             >
               {Object.entries(engineNames).map(([value, label]) => (
                 <option key={value} value={value}>
                   {label}
-                  {native(value as FleetEngine) ? '' : ' · adapter needed'}
+                  {native(value as FleetEngine) ? '' : ' · Crosswalk'}
                 </option>
               ))}
             </select>
           </Field>
-          {engine === 'hermes' && (
+          <Field label="Task delivery">
+            <select
+              className="input"
+              value={delivery}
+              onChange={(event) => setDelivery(event.target.value as 'native' | 'crosswalk')}
+              disabled={busy}
+            >
+              <option value="native" disabled={!native(engine)}>
+                Native agent on this computer
+              </option>
+              <option value="crosswalk">Crosswalk handoff</option>
+            </select>
+          </Field>
+          {delivery === 'crosswalk' && (
+            <>
+              <Field label="Crosswalk account">
+                <select
+                  className="input"
+                  value={handoffAccount}
+                  onChange={(event) => {
+                    setHandoffAccount(event.target.value);
+                    setRecipient('');
+                    setSpace('');
+                  }}
+                  disabled={busy}
+                >
+                  <option value="">Connection pending</option>
+                  {view.handoffConnections.map((account) => (
+                    <option key={account.id} value={account.id}>
+                      {account.name}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+              {directory && (
+                <>
+                  <p className="bot-detail">Crosswalk account: {directory.username}</p>
+                  <Field label="Agent recipient">
+                    <select
+                      className="input"
+                      value={recipient}
+                      onChange={(event) => setRecipient(event.target.value)}
+                      required
+                      disabled={busy}
+                    >
+                      <option value="">Choose your agent</option>
+                      {directory.recipients.map((agent) => (
+                        <option key={agent.id} value={agent.id}>
+                          {agent.name} · {agent.id.slice(-4)}
+                        </option>
+                      ))}
+                    </select>
+                  </Field>
+                  {directory.recipients.find((agent) => agent.id === recipient)?.aliases.length ? (
+                    <p className="bot-detail">
+                      This number also answers as{' '}
+                      {directory.recipients
+                        .find((agent) => agent.id === recipient)!
+                        .aliases.join(', ')}
+                      .
+                    </p>
+                  ) : null}
+                  <Field label="Private workspace">
+                    <select
+                      className="input"
+                      value={space}
+                      onChange={(event) => setSpace(event.target.value)}
+                      required
+                      disabled={busy}
+                    >
+                      <option value="">Choose a private workspace</option>
+                      {directory.spaces.map((name) => (
+                        <option key={name} value={name}>
+                          {name}
+                        </option>
+                      ))}
+                    </select>
+                  </Field>
+                </>
+              )}
+              {directoryError && <Notice>{directoryError}</Notice>}
+              {!handoffAccount && (
+                <Notice>
+                  Connect Crosswalk to choose an existing agent. This assignment stays pending until
+                  its route is verified.
+                </Notice>
+              )}
+              <p className="bot-detail">
+                The task goes to the chosen agent. Its result is a report from that agent. A cloud
+                service keeps its own computer.
+              </p>
+            </>
+          )}
+          {engine === 'hermes' && delivery === 'native' && (
             <Field label="Hermes profile">
               <Input
                 name="profile"
@@ -145,7 +283,7 @@ function BotEditor({
               />
             </Field>
           )}
-          <Field label="Computer">
+          <Field label={delivery === 'crosswalk' ? 'Requested computer' : 'Computer'}>
             <select
               className="input"
               value={deviceId}
@@ -177,19 +315,23 @@ function BotEditor({
               />
             </Field>
           )}
-          <p className="bot-detail">A verified assignment keeps each task on that computer.</p>
-          {!native(engine) && (
-            <Notice>
-              This agent needs a supported adapter. You can save its assignment, but it cannot run
-              tasks yet.
-            </Notice>
+          <p className="bot-detail">
+            {delivery === 'native'
+              ? 'A verified assignment keeps each task on that computer.'
+              : 'The handoff includes this computer as a requirement. It does not move the app or prove where the agent executes.'}
+          </p>
+          {!native(engine) && !handoffAccount && (
+            <Notice>This agent needs its Crosswalk connection before it can receive tasks.</Notice>
           )}
           {error && <Notice>{error}</Notice>}
           <div className="bot-editor-actions">
             <Button variant="outline" type="button" onClick={onClose} disabled={busy}>
               Cancel
             </Button>
-            <Button type="submit" disabled={busy}>
+            <Button
+              type="submit"
+              disabled={busy || (delivery === 'crosswalk' && Boolean(handoffAccount) && !directory)}
+            >
               {busy ? 'Verifying…' : deviceId ? 'Verify and save' : 'Save bot'}
             </Button>
           </div>
@@ -202,7 +344,7 @@ function BotEditor({
 export function Bots() {
   const { data, error, refresh } = usePageData<FleetView>('/api/fleet');
   const [editing, setEditing] = useState<FleetBot | null | undefined>();
-  const [manual, setManual] = useState(false);
+  const [manual, setManual] = useState<false | 'desktop' | 'crosswalk'>(false);
   const [discovery, setDiscovery] = useState<string | null>(null);
   const [selected, setSelected] = useState('');
   const [instruction, setInstruction] = useState('');
@@ -216,6 +358,7 @@ export function Bots() {
     botId: string;
   } | null>(null);
   const connect = useRef<HTMLButtonElement>(null);
+  const manualReturn = useRef<HTMLElement | null>(null);
   const composer = useRef<HTMLTextAreaElement>(null);
   const currentJobs = useRef(data?.jobs ?? []);
   currentJobs.current = data?.jobs ?? [];
@@ -224,7 +367,7 @@ export function Bots() {
     const timer = window.setInterval(() => {
       if (document.hidden || checking) return;
       const jobs = currentJobs.current.filter((job) =>
-        ['starting', 'running', 'stopping'].includes(job.status),
+        ['starting', 'running', 'queued', 'claimed', 'stopping'].includes(job.status),
       );
       if (!jobs.length) return;
       checking = true;
@@ -243,9 +386,14 @@ export function Bots() {
   const runnable = Boolean(
     bot?.identity &&
     device?.online &&
-    native(bot.engine) &&
-    bot.identity.engines.includes(bot.engine as (typeof nativeEngines)[number]) &&
-    !data.jobs.some((job) => job.botId === bot.id && active(job)),
+    (bot.delivery === 'crosswalk'
+      ? Boolean(
+          bot.handoff &&
+          data.handoffConnections.some((account) => account.id === bot.handoff!.connectionId),
+        )
+      : native(bot.engine) &&
+        bot.identity.engines.includes(bot.engine as (typeof nativeEngines)[number])) &&
+    !data.jobs.some((job) => job.deviceId === bot.deviceId && active(job)),
   );
 
   async function perform(action: () => Promise<unknown>) {
@@ -301,7 +449,7 @@ export function Bots() {
       <div className="bots-intro">
         <div>
           <h2>Your bots, on your computers</h2>
-          <p>Assign an agent to a real computer. Its accounts and sign-ins stay there.</p>
+          <p>Run native agents on your computers or hand tasks to your connected apps.</p>
         </div>
         <Button onClick={() => setEditing(null)} disabled={busy}>
           <Plus size={16} /> Add bot
@@ -338,10 +486,35 @@ export function Bots() {
               ))}
             </select>
           )}
-          <Button ref={connect} variant="outline" onClick={() => setManual(true)}>
+          <Button
+            ref={connect}
+            variant="outline"
+            onClick={(event) => {
+              manualReturn.current = event.currentTarget;
+              setManual('desktop');
+            }}
+          >
             Connect computers
           </Button>
         </div>
+      </section>
+      <section className="bots-connection" aria-label="Agent handoff connection">
+        <div>
+          <strong>Agent handoffs</strong>
+          <p>Crosswalk routes tasks to existing agents in your private workspaces.</p>
+          {data.handoffConnections.map((account) => (
+            <p key={account.id}>{account.name} · connected</p>
+          ))}
+        </div>
+        <Button
+          variant="outline"
+          onClick={(event) => {
+            manualReturn.current = event.currentTarget;
+            setManual('crosswalk');
+          }}
+        >
+          Connect Crosswalk
+        </Button>
       </section>
       {(message || data.error || error) && (
         <Notice>{message || data.error || errorMessage(error)}</Notice>
@@ -350,9 +523,16 @@ export function Bots() {
         {data.bots.map((item) => {
           const computer = data.devices.find((candidate) => candidate.id === item.deviceId);
           const hasAgent =
-            native(item.engine) &&
-            item.identity?.engines.includes(item.engine as (typeof nativeEngines)[number]);
-          const current = data.jobs.find((job) => job.botId === item.id && active(job));
+            item.delivery === 'crosswalk'
+              ? Boolean(
+                  item.handoff &&
+                  data.handoffConnections.some(
+                    (account) => account.id === item.handoff!.connectionId,
+                  ),
+                )
+              : native(item.engine) &&
+                item.identity?.engines.includes(item.engine as (typeof nativeEngines)[number]);
+          const current = data.jobs.find((job) => job.deviceId === item.deviceId && active(job));
           const label = current
             ? statuses[current.status]
             : !item.identity
@@ -382,6 +562,12 @@ export function Bots() {
                 <Monitor size={16} /> {item.computerName}
               </p>
               {item.profile && <p className="bot-detail">Hermes profile: {item.profile}</p>}
+              {item.handoff && (
+                <p className="bot-detail">
+                  Crosswalk: {item.handoff.recipientName} · {item.handoff.space}. The agent reports
+                  its result.
+                </p>
+              )}
               {serviceDetails[item.engine] && (
                 <p className="bot-detail">
                   {serviceDetails[item.engine]!.text}{' '}
@@ -445,7 +631,7 @@ export function Bots() {
               ref={composer}
               className="input bot-task-input"
               required
-              maxLength={32000}
+              maxLength={bot?.handoff ? 16000 : 32000}
               value={instruction}
               onChange={(event) => setInstruction(event.target.value)}
               disabled={busy || submissionHeld}
@@ -454,8 +640,11 @@ export function Bots() {
           </Field>
           {bot && (
             <p className="bot-detail">
-              This task will use {engineNames[bot.engine]} on {bot.computerName}. The agent keeps
-              its normal approval rules.
+              {bot.delivery === 'crosswalk'
+                ? bot.handoff
+                  ? `This task goes to ${bot.handoff.recipientName} in ${bot.handoff.space}. It requests ${bot.computerName}. The receiving agent keeps its own accounts and approval rules.`
+                  : 'Choose this bot’s Crosswalk recipient and private workspace before sending.'
+                : `This task will use ${engineNames[bot.engine]} on ${bot.computerName}. The agent keeps its normal approval rules.`}
             </p>
           )}
           {submissionHeld && (
@@ -486,12 +675,22 @@ export function Bots() {
                   {job.computerName} · {engineNames[job.engine]}
                 </span>
               </div>
-              <span className="bot-status">{statuses[job.status]}</span>
+              <span className="bot-status">
+                {job.delivery === 'crosswalk' && job.status === 'stopping'
+                  ? 'Stop requested'
+                  : statuses[job.status]}
+              </span>
             </header>
             <p className="bot-job-request">{job.instruction}</p>
+            {job.delivery === 'crosswalk' && (
+              <p className="bot-detail">
+                Handoff to {job.recipient}. A reported result is the agent’s own account of the
+                work.
+              </p>
+            )}
             {job.error && <Notice>{job.error}</Notice>}
             {job.receipt?.output && (
-              <details open={job.status === 'finished'}>
+              <details open={job.status === 'finished' || job.status === 'reported'}>
                 <summary>Agent result</summary>
                 <pre>{job.receipt.output}</pre>
               </details>
@@ -533,19 +732,23 @@ export function Bots() {
       )}
       {manual && (
         <ManualMcpDialog
-          initial={{ name: 'Desktop Commander', endpoint: desktopCommanderEndpoint }}
+          initial={
+            manual === 'crosswalk'
+              ? { name: 'Crosswalk', endpoint: crosswalkEndpoint, auth: 'bearer' }
+              : { name: 'Desktop Commander', endpoint: desktopCommanderEndpoint }
+          }
           onClose={() => setManual(false)}
           onCreated={(id) => {
             setManual(false);
             setDiscovery(id);
           }}
-          returnFocus={() => connect.current}
+          returnFocus={() => manualReturn.current ?? connect.current}
         />
       )}
       {discovery && (
         <AppDiscoveryDialog
           id={discovery}
-          returnFocus={() => connect.current}
+          returnFocus={() => manualReturn.current ?? connect.current}
           onClose={() => {
             setDiscovery(null);
             void refresh();

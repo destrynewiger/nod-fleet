@@ -12,10 +12,16 @@ import {
   type FleetSpec,
   type NativeEngine,
 } from '../ports/fleet.ts';
-import type { FleetBot, FleetJob, FleetView } from '../shared/fleet.ts';
+import type {
+  FleetBot,
+  FleetDirectory,
+  FleetHandoff,
+  FleetJob,
+  FleetView,
+} from '../shared/fleet.ts';
 import { transaction } from './transaction.ts';
 
-const active = ['starting', 'running', 'stopping', 'uncertain'];
+const active = ['starting', 'running', 'queued', 'claimed', 'stopping', 'uncertain'];
 const botInput = z
   .object({
     name: z.string().trim().min(1).max(80),
@@ -36,11 +42,25 @@ const botInput = z
     deviceId: z.uuid().nullable(),
     computerName: z.string().trim().min(1).max(255).optional(),
     revision: z.number().int().min(0),
+    delivery: z.enum(['native', 'crosswalk']).optional(),
+    handoff: z
+      .object({
+        connectionId: z.uuid(),
+        recipient: z.string().regex(/^\d{16}$/),
+        space: z.string().min(1).max(200),
+      })
+      .strict()
+      .nullable()
+      .optional(),
   })
   .strict()
   .refine(
     (value) => value.engine === 'hermes' || value.profile === null,
     'Only Hermes uses a named profile.',
+  )
+  .refine(
+    (value) => !(value.handoff || value.delivery === 'crosswalk') || value.profile === null,
+    'A Crosswalk handoff uses its recipient profile, not a native CLI profile.',
   );
 type JobRow = {
   id: string;
@@ -68,6 +88,8 @@ type BotRow = {
   computer_name: string;
   identity: FleetBot['identity'];
   revision: number;
+  handoff: FleetHandoff | null;
+  delivery: FleetBot['delivery'];
 };
 const failure = (message: string, statusCode = 400) =>
   Object.assign(new Error(message), { statusCode });
@@ -81,24 +103,41 @@ const specHash = (spec: FleetSpec) =>
     spec.engine,
     spec.profile,
     spec.instruction,
+    ...(spec.handoff
+      ? [
+          spec.handoff.connectionId,
+          spec.handoff.connection.pathId,
+          spec.handoff.connection.binding,
+          spec.handoff.username,
+          spec.handoff.recipient,
+          spec.handoff.recipientName,
+          spec.handoff.aliases,
+          spec.handoff.space,
+        ]
+      : []),
   ]);
 const botView = (row: BotRow): FleetBot => ({
   id: row.id,
   name: row.name,
   engine: row.engine,
+  delivery: row.delivery,
   profile: row.profile,
   deviceId: row.device_id,
   computerName: row.computer_name,
   identity: row.identity,
   revision: row.revision,
+  handoff: row.handoff ?? null,
 });
 const jobView = (row: JobRow): FleetJob => ({
   id: row.id,
   botId: row.bot_id,
   botName: row.bot_name,
+  deviceId: row.spec.deviceId,
   computerName: row.computer_name,
   engine: row.spec.engine,
   instruction: row.spec.instruction,
+  delivery: row.spec.handoff ? 'crosswalk' : 'native',
+  ...(row.spec.handoff ? { recipient: row.spec.handoff.recipientName } : {}),
   status: row.status,
   receipt: row.receipt,
   error: row.error,
@@ -110,8 +149,11 @@ export async function initializeFleetSchema(pool: Pool) {
     [
       'CREATE TABLE IF NOT EXISTS fleet_settings (owner_id text PRIMARY KEY, connection_id uuid);',
       'CREATE TABLE IF NOT EXISTS fleet_bots (id uuid NOT NULL,owner_id text NOT NULL,name text NOT NULL,engine text NOT NULL,profile text,device_id uuid,computer_name text NOT NULL,identity jsonb,revision integer NOT NULL,PRIMARY KEY(owner_id,id),UNIQUE(owner_id,name));',
+      'ALTER TABLE fleet_bots ADD COLUMN IF NOT EXISTS handoff jsonb;',
+      "ALTER TABLE fleet_bots ADD COLUMN IF NOT EXISTS delivery text NOT NULL DEFAULT 'native';",
       'CREATE TABLE IF NOT EXISTS fleet_jobs (id uuid NOT NULL,owner_id text NOT NULL,bot_id uuid NOT NULL,bot_name text NOT NULL,computer_name text NOT NULL,spec jsonb NOT NULL,connection jsonb NOT NULL,client_digest text NOT NULL,digest text NOT NULL,pid integer,stop_requested boolean NOT NULL DEFAULT false,status text NOT NULL,receipt jsonb,error text,created_at timestamptz NOT NULL DEFAULT now(),updated_at timestamptz NOT NULL DEFAULT now(),PRIMARY KEY(owner_id,id),FOREIGN KEY(owner_id,bot_id) REFERENCES fleet_bots(owner_id,id));',
       "CREATE UNIQUE INDEX IF NOT EXISTS fleet_computer_active ON fleet_jobs(owner_id,(spec->>'deviceId')) WHERE status IN ('starting','running','stopping','uncertain');",
+      "CREATE UNIQUE INDEX IF NOT EXISTS fleet_computer_pending ON fleet_jobs(owner_id,(spec->>'deviceId')) WHERE status IN ('starting','running','queued','claimed','stopping','uncertain');",
     ].join('\n'),
   );
 }
@@ -146,7 +188,9 @@ export async function createFleet(
     );
     const id = rows[0]?.connection_id;
     return id
-      ? (await options.connections()).find((connection) => connection.connectionId === id)
+      ? (await options.connections()).find(
+          (connection) => connection.connectionId === id && connection.kind !== 'crosswalk',
+        )
       : undefined;
   }
 
@@ -172,7 +216,7 @@ export async function createFleet(
         true,
       );
     await pool.query(
-      "UPDATE fleet_jobs SET status=CASE WHEN $3='running' AND stop_requested THEN 'stopping' ELSE $3 END,receipt=$4,error=$5,updated_at=now() WHERE owner_id=$1 AND id=$2 AND status=ANY($6::text[])",
+      "UPDATE fleet_jobs SET status=CASE WHEN $3 IN ('running','queued','claimed') AND stop_requested THEN 'stopping' ELSE $3 END,receipt=$4,error=$5,updated_at=now() WHERE owner_id=$1 AND id=$2 AND status=ANY($6::text[])",
       [owner, row.id, receipt.status, JSON.stringify(receipt), receipt.error ?? null, active],
     );
     options.refresh();
@@ -181,13 +225,11 @@ export async function createFleet(
 
   function run(row: JobRow): FleetRun {
     return {
-      id: row.id,
+      ...row.spec,
       digest: row.digest,
-      engine: row.spec.engine,
-      deviceId: row.spec.deviceId,
-      identityId: row.spec.identityId,
-      hostname: row.spec.hostname,
       pid: row.status === 'uncertain' ? null : row.pid,
+      remoteId: row.receipt?.remoteId,
+      stopRequested: row.stop_requested,
     };
   }
 
@@ -210,6 +252,8 @@ export async function createFleet(
         controller.signal,
       );
       await accept(await job(row.id), receipt);
+      const latest = await job(row.id);
+      if (latest.stop_requested && active.includes(latest.status)) await stop(row.id);
     } catch (cause) {
       const current = await job(row.id);
       if (!active.includes(current.status)) return;
@@ -253,7 +297,12 @@ export async function createFleet(
     ]);
     return {
       connectionId: connection?.connectionId ?? null,
-      connections: connections.map((item) => ({ id: item.connectionId, name: item.name })),
+      connections: connections
+        .filter((item) => item.kind !== 'crosswalk')
+        .map((item) => ({ id: item.connectionId, name: item.name })),
+      handoffConnections: connections
+        .filter((item) => item.kind === 'crosswalk')
+        .map((item) => ({ id: item.connectionId, name: item.name })),
       devices,
       bots: bots.rows.map(botView),
       jobs: jobs.rows.map(jobView),
@@ -263,7 +312,38 @@ export async function createFleet(
 
   async function saveBot(id: string, raw: unknown) {
     const input = botInput.parse(raw);
+    const delivery =
+      input.delivery ??
+      (input.handoff || !(nativeEngines as readonly string[]).includes(input.engine)
+        ? 'crosswalk'
+        : 'native');
+    if (delivery === 'native' && input.handoff)
+      throw failure('A native task cannot also have a Crosswalk route.', 400);
     const connection = await selected();
+    const handoffConnection = input.handoff
+      ? (await options.connections()).find(
+          (candidate) =>
+            candidate.kind === 'crosswalk' &&
+            candidate.connectionId === input.handoff!.connectionId,
+        )
+      : undefined;
+    let handoff: FleetHandoff | null = null;
+    if (input.handoff) {
+      if (!handoffConnection || !options.provider.directory)
+        throw failure('Connect Crosswalk before saving this handoff.', 409);
+      const directory = await options.provider.directory(handoffConnection);
+      const recipient = directory.recipients.find((entry) => entry.id === input.handoff!.recipient);
+      if (!recipient || !directory.spaces.includes(input.handoff.space))
+        throw failure('Choose an existing agent and an owned private Crosswalk workspace.', 409);
+      handoff = {
+        connectionId: handoffConnection.connectionId,
+        username: directory.username,
+        recipient: recipient.id,
+        recipientName: recipient.name,
+        aliases: recipient.aliases,
+        space: input.handoff.space,
+      };
+    }
     if (input.deviceId && !connection)
       throw failure('Connect Desktop Commander and select its account first.', 409);
     const device =
@@ -280,6 +360,16 @@ export async function createFleet(
       ]);
       if (connection && (await selected(client))?.binding !== connection.binding)
         throw failure('The computer connection changed. Select it again.', 409);
+      if (
+        handoffConnection &&
+        !(await options.connections()).some(
+          (candidate) =>
+            candidate.kind === 'crosswalk' &&
+            candidate.connectionId === handoffConnection.connectionId &&
+            candidate.binding === handoffConnection.binding,
+        )
+      )
+        throw failure('The Crosswalk connection changed. Verify the route again.', 409);
       const existing = (
         await client.query<BotRow>(
           'SELECT * FROM fleet_bots WHERE owner_id=$1 AND id=$2 FOR UPDATE',
@@ -298,7 +388,7 @@ export async function createFleet(
           409,
         );
       const result = await client.query<BotRow>(
-        'INSERT INTO fleet_bots(id,owner_id,name,engine,profile,device_id,computer_name,identity,revision) VALUES($1,$2,$3,$4,$5,$6,$7,$8,1) ON CONFLICT(owner_id,id) DO UPDATE SET name=EXCLUDED.name,engine=EXCLUDED.engine,profile=EXCLUDED.profile,device_id=EXCLUDED.device_id,computer_name=EXCLUDED.computer_name,identity=EXCLUDED.identity,revision=fleet_bots.revision+1 RETURNING *',
+        'INSERT INTO fleet_bots(id,owner_id,name,engine,profile,device_id,computer_name,identity,revision,handoff,delivery) VALUES($1,$2,$3,$4,$5,$6,$7,$8,1,$9,$10) ON CONFLICT(owner_id,id) DO UPDATE SET name=EXCLUDED.name,engine=EXCLUDED.engine,profile=EXCLUDED.profile,device_id=EXCLUDED.device_id,computer_name=EXCLUDED.computer_name,identity=EXCLUDED.identity,handoff=EXCLUDED.handoff,delivery=EXCLUDED.delivery,revision=fleet_bots.revision+1 RETURNING *',
         [
           id,
           owner,
@@ -308,6 +398,8 @@ export async function createFleet(
           device?.id ?? null,
           device?.name ?? input.computerName ?? 'Not assigned',
           identity ? JSON.stringify(identity) : null,
+          handoff ? JSON.stringify(handoff) : null,
+          delivery,
         ],
       );
       return botView(result.rows[0]!);
@@ -359,9 +451,14 @@ export async function createFleet(
         throw failure('The bot assignment changed. Review its computer before sending.', 409);
       if (!bot.identity || !bot.device_id)
         throw failure('Choose and verify this bot’s computer before sending a task.', 409);
-      if (!(nativeEngines as readonly string[]).includes(bot.engine))
+      if (bot.delivery === 'crosswalk' && !bot.handoff)
+        throw failure(
+          'Configure this bot’s Crosswalk route before sending a task. No native agent was substituted.',
+          409,
+        );
+      if (!bot.handoff && !(nativeEngines as readonly string[]).includes(bot.engine))
         throw failure('This agent needs a supported native adapter before it can run tasks.', 409);
-      if (!bot.identity.engines.includes(bot.engine as NativeEngine))
+      if (!bot.handoff && !bot.identity.engines.includes(bot.engine as NativeEngine))
         throw failure('This agent is not installed on the assigned computer.', 409);
       const busy = await client.query(
         "SELECT id FROM fleet_jobs WHERE owner_id=$1 AND spec->>'deviceId'=$2 AND status=ANY($3::text[]) LIMIT 1",
@@ -377,10 +474,21 @@ export async function createFleet(
         deviceId: bot.device_id,
         identityId: bot.identity.id,
         hostname: bot.identity.hostname,
-        engine: bot.engine as NativeEngine,
+        engine: bot.engine,
         profile: bot.profile,
         instruction: input.instruction,
       };
+      if (bot.handoff) {
+        const relay = (await options.connections()).find(
+          (candidate) =>
+            candidate.kind === 'crosswalk' && candidate.connectionId === bot.handoff!.connectionId,
+        );
+        if (!relay || !options.provider.directory)
+          throw failure('The saved Crosswalk connection is unavailable. No task was queued.', 409);
+        spec.handoff = { ...bot.handoff, connection: relay };
+        if (input.instruction.length > 16000)
+          throw failure('Shorten the Crosswalk task to 16,000 characters before sending.', 400);
+      }
       const result = await client.query<JobRow>(
         "INSERT INTO fleet_jobs(id,owner_id,bot_id,bot_name,computer_name,spec,connection,client_digest,digest,status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'starting') RETURNING *",
         [
@@ -458,12 +566,28 @@ export async function createFleet(
 
   function registerRoutes(app: FastifyInstance) {
     app.get('/api/fleet', view);
+    app.get<{ Params: { id: string } }>(
+      '/api/fleet/handoffs/:id',
+      async (request): Promise<FleetDirectory> => {
+        const id = z.uuid().parse(request.params.id);
+        const connection = (await options.connections()).find(
+          (candidate) => candidate.kind === 'crosswalk' && candidate.connectionId === id,
+        );
+        if (!connection || !options.provider.directory)
+          throw failure('The Crosswalk connection is unavailable.', 404);
+        return options.provider.directory(connection);
+      },
+    );
     app.get<{ Params: { id: string } }>('/api/fleet/jobs/:id', async (request) =>
       jobView(await job(z.uuid().parse(request.params.id))),
     );
     app.put('/api/fleet/connection', async (request) => {
       const input = z.object({ connectionId: z.uuid() }).strict().parse(request.body);
-      if (!(await options.connections()).some((item) => item.connectionId === input.connectionId))
+      if (
+        !(await options.connections()).some(
+          (item) => item.kind !== 'crosswalk' && item.connectionId === input.connectionId,
+        )
+      )
         throw failure('Choose a connected Desktop Commander account.', 409);
       await transaction(async (client) => {
         await client.query('SELECT owner_id FROM fleet_settings WHERE owner_id=$1 FOR UPDATE', [
