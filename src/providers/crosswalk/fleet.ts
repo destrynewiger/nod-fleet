@@ -85,8 +85,8 @@ export function createCrosswalkFleet(native: FleetProvider, call: Call): FleetPr
     const cached = directories.get(key);
     if (!fresh && cached && cached.expires > Date.now()) return cached.value;
     const [accountData, numbersData] = await Promise.all([
-      call(connection, 'account_whoami', {}, signal).then(result),
-      call(connection, 'account_numbers', {}, signal).then(result),
+      call(connection, 'account', { action: 'whoami' }, signal).then(result),
+      call(connection, 'account', { action: 'numbers' }, signal).then(result),
     ]);
     const account = z
       .object({
@@ -193,14 +193,16 @@ export function createCrosswalkFleet(native: FleetProvider, call: Call): FleetPr
   async function readTask(run: FleetRun, signal?: AbortSignal) {
     const connection = run.handoff!.connection;
     if (run.remoteId) {
-      const found = result(await call(connection, 'tasks_get', { id: run.remoteId }, signal));
+      const found = result(
+        await call(connection, 'tasks', { action: 'get', id: run.remoteId }, signal),
+      );
       return checkedTask(found.task ?? found, run);
     }
     const found = result(
       await call(
         connection,
-        'tasks_list',
-        { crosswalk: run.handoff!.space, status: 'all' },
+        'tasks',
+        { action: 'list', crosswalk: run.handoff!.space, status: 'all' },
         signal,
       ),
     );
@@ -276,8 +278,9 @@ export function createCrosswalkFleet(native: FleetProvider, call: Call): FleetPr
         const answer = result(
           await call(
             route.connection,
-            'tasks_add',
+            'tasks',
             {
+              action: 'add',
               crosswalk: route.space,
               for: route.recipient,
               title: title(spec),
@@ -308,8 +311,8 @@ export function createCrosswalkFleet(native: FleetProvider, call: Call): FleetPr
       try {
         await call(
           route.connection,
-          'tasks_update',
-          { id: task.id, title: stopTitle(run) },
+          'tasks',
+          { action: 'update', id: task.id, title: stopTitle(run) },
           signal,
         );
         const stopped = { ...run, remoteId: task.id, stopRequested: true };

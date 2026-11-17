@@ -524,7 +524,8 @@ test(
       async (request, reply) => {
         const { tool, input } = request.body;
         const response = (data: unknown) => content(JSON.stringify(data));
-        if (tool === 'account_whoami')
+        assert.ok(tool === 'account' || tool === 'tasks');
+        if (tool === 'account' && input.action === 'whoami')
           return response({
             username,
             crosswalks: [
@@ -533,7 +534,7 @@ test(
               { slug: 'someone-else', visibility: 'private' },
             ],
           });
-        if (tool === 'account_numbers')
+        if (tool === 'account' && input.action === 'numbers')
           return response({
             you: '1111000000000000',
             numbers: [
@@ -550,7 +551,8 @@ test(
                 : []),
             ],
           });
-        if (tool === 'tasks_add') {
+        assert.equal(tool, 'tasks');
+        if (input.action === 'add') {
           assert.equal(input.crosswalk, 'example-private');
           assert.equal(input.for, recipient);
           assert.equal(input.invite, false);
@@ -576,7 +578,7 @@ test(
           }
           return response({ kind: 'task_added', task });
         }
-        if (tool === 'tasks_list') {
+        if (input.action === 'list') {
           assert.equal(input.crosswalk, 'example-private');
           const tasks = (
             await pool.query<{ data: Record<string, unknown> }>(
@@ -596,9 +598,9 @@ test(
           )
         ).rows[0]?.data;
         assert.ok(task);
-        if (tool === 'tasks_get') return response({ kind: 'task', task });
-        assert.equal(tool, 'tasks_update');
-        assert.deepEqual(Object.keys(input).sort(), ['id', 'title']);
+        if (input.action === 'get') return response({ kind: 'task', task });
+        assert.equal(input.action, 'update');
+        assert.deepEqual(Object.keys(input).sort(), ['action', 'id', 'title']);
         const updated = { ...task, title: input.title };
         await pool.query('UPDATE fixture_crosswalk_tasks SET data=$2 WHERE id=$1', [
           input.id,
